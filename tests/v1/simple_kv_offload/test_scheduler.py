@@ -1135,3 +1135,155 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
         assert bid in ext_block_ids, (
             f"Load GPU block {bid} should be an ext_comp block, not a comp or new block"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Reset with pending eager stores releases block refs
+# ---------------------------------------------------------------------------
+def test_reset_pending_eager_stores() -> None:
+    """Eager mode: reset() releases GPU/CPU refs from in-flight stores."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    num_blocks = 2
+    req = make_request(num_blocks=num_blocks)
+
+    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    block_ids = kv_blocks.get_block_ids()
+    sched_out = make_scheduler_output(
+        {req.request_id: num_blocks * BLOCK_SIZE},
+        new_reqs={req.request_id: block_ids},
+    )
+
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+    assert len(sched._store_event_to_blocks) > 0
+
+    # GPU blocks should have elevated ref_cnt from touch()
+    for bid in meta.store_gpu_blocks:
+        assert gpu_pool.blocks[bid].ref_cnt > 0
+
+    # Free the request's own block refs (simulates preemption)
+    gpu_pool.free_blocks(gpu_pool.blocks[bid] for bid in block_ids[0])
+
+    # Reset should release the remaining touch refs
+    assert sched.reset() is True
+    assert len(sched._store_event_to_blocks) == 0
+    assert len(sched._reqs_to_store) == 0
+    assert len(sched._store_event_to_reqs) == 0
+
+    # All GPU blocks should now be free (ref_cnt == 0) except null block
+    num_used = gpu_pool.num_gpu_blocks - gpu_pool.get_num_free_blocks()
+    assert num_used == 1, f"Expected only null block in use, got {num_used}"
+
+    # GPU prefix cache reset should now succeed
+    assert gpu_pool.reset_prefix_cache() is True
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Reset with pending lazy stores releases block refs
+# ---------------------------------------------------------------------------
+def test_reset_pending_lazy_stores() -> None:
+    """Lazy mode: reset() releases GPU/CPU refs from in-flight stores."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    num_blocks = 2
+    req = make_request(num_blocks=num_blocks)
+
+    # Allocate, hash, and free — blocks move to free queue with hashes
+    gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, num_blocks, group_id=0)
+    gpu_pool.free_blocks(gpu_blocks)
+
+    # Push hashed blocks to LRU head
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+
+    # Lazy scanner offloads old hashed blocks
+    sched_out = make_scheduler_output({})
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+    assert len(sched._store_event_to_blocks) > 0
+
+    gpu_pool.free_blocks(fillers)
+
+    # Reset should release all refs and clear CPU cache
+    assert sched.reset() is True
+    assert len(sched._store_event_to_blocks) == 0
+    assert sched._cursor is None
+
+    # No CPU cache hits after reset
+    req2 = Request(
+        request_id="req-after-lazy-reset",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, _ = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == 0, "CPU cache should be empty after reset"
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Reset with pending loads releases block refs
+# ---------------------------------------------------------------------------
+def test_reset_pending_loads() -> None:
+    """reset() releases GPU/CPU refs from in-flight loads."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    num_blocks = 2
+
+    # First store blocks to CPU
+    req = make_request(num_blocks=num_blocks)
+    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    block_ids = kv_blocks.get_block_ids()
+    sched_out = make_scheduler_output(
+        {req.request_id: num_blocks * BLOCK_SIZE},
+        new_reqs={req.request_id: block_ids},
+    )
+    meta = sched.build_connector_meta(sched_out)
+    simulate_store_completion(sched, meta.store_event)
+
+    # Start a load — CPU cache hit
+    req2 = Request(
+        request_id="req-load-reset",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens > 0
+
+    gpu_blocks2 = gpu_pool.get_new_blocks(num_blocks)
+    kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
+
+    block_ids2 = kv_blocks2.get_block_ids()
+    sched_out2 = make_scheduler_output(
+        {req2.request_id: 1},
+        new_reqs={req2.request_id: block_ids2},
+    )
+    meta2 = sched.build_connector_meta(sched_out2)
+    assert meta2.load_event >= 0
+    assert req2.request_id in sched._reqs_to_load
+
+    # Free request block refs (simulates preemption)
+    gpu_pool.free_blocks(gpu_pool.blocks[bid] for bid in block_ids[0])
+    gpu_pool.free_blocks(gpu_pool.blocks[bid] for bid in block_ids2[0])
+
+    # Reset should release load touch refs
+    assert sched.reset() is True
+    assert len(sched._reqs_to_load) == 0
+    assert len(sched._load_event_to_reqs) == 0
+
+    # All GPU blocks free
+    num_used = gpu_pool.num_gpu_blocks - gpu_pool.get_num_free_blocks()
+    assert num_used == 1, f"Expected only null block in use, got {num_used}"

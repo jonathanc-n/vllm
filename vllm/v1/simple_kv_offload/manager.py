@@ -604,7 +604,9 @@ class SimpleCPUOffloadScheduler:
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
-        transfer = self._store_event_to_blocks.pop(event_idx)
+        transfer = self._store_event_to_blocks.pop(event_idx, None)
+        if transfer is None:
+            return  # guard stale events from before a reset() call
         self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
@@ -737,3 +739,32 @@ class SimpleCPUOffloadScheduler:
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         return self.cpu_block_pool.take_events()
+
+    def reset(self) -> bool:
+        """Abort all pending transfers, release block refs, reset CPU cache."""
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None:
+            return True
+
+        # Release GPU/CPU refs held by pending store transfers
+        for transfer in self._store_event_to_blocks.values():
+            gpu_pool.free_blocks(gpu_pool.blocks[bid] for bid in transfer.gpu_block_ids)
+            self.cpu_block_pool.free_blocks(
+                self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids
+            )
+        self._store_event_to_blocks.clear()
+
+        # Release GPU/CPU refs held by pending load transfers
+        for req_id in list(self._reqs_to_load):
+            self._cleanup_load_request(req_id)
+
+        self._load_event_to_reqs.clear()
+        self._reqs_to_store.clear()
+        self._store_event_to_reqs.clear()
+        self._store_event_pending_counts.clear()
+        self._cursor = None
+        # NOTE: _load_event_counter / _store_event_counter are not
+        # reset as they are monotonic and must stay ahead of the workers
+        # high-water marks to avoid event index collisions
+
+        return self.cpu_block_pool.reset_prefix_cache()
