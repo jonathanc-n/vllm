@@ -238,7 +238,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.scheduler_manager.take_events()
         return []
 
-    # Workers are not contacted. In-flight transfers drain naturally,
+    # NOTE: Workers are not contacted. In-flight transfers drain naturally,
     # and stale completions are ignored by the guarded
     # SimpleCPUOffloadScheduler._process_store_event().
     def reset_cache(self) -> bool | None:
